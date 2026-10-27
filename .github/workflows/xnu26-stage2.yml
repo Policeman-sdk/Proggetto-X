@@ -136,7 +136,8 @@ jobs:
         run: |
           mkdir -p collect
           cp build.log collect/ 2>/dev/null || true
-          find out -name 'kernel*' -maxdepth 6 -type f -not -name '*.dSYM' 2>/dev/null | head -20 | while read f; do cp "$f" collect/; done
+          # build-kernel.sh emits mach.development.b2l (not a file named kernel*).
+          find out -type f -name 'mach.development.b2l' -print -quit 2>/dev/null | while read f; do cp "$f" collect/; done
           ls -la collect
 
       - uses: actions/upload-artifact@v4
