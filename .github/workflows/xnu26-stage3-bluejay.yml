@@ -1,0 +1,114 @@
+name: xnu26-stage3-bluejay-port-audit
+
+# Stage 3 preflight for the Pixel 6a (bluejay).
+#
+# This workflow intentionally produces a port-audit artifact, not a kernel.
+# The existing bluejay patches target XNU 8796 and do not apply to the pinned
+# XNU 12377 source. A bluejay XNU 12377 patch set must be authored and reviewed
+# before a kernel-build workflow can honestly produce a bluejay kernel.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  port-audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      XNU_SHA: ac9718fb1af618d5ce8678d0dc6e8a58f252216f
+      PIXOS_SHA: 04457e5ddae2164778bd5e75c352a34dac916de9
+    steps:
+      - name: Fetch pinned source trees
+        shell: bash
+        run: |
+          set -euo pipefail
+          git init -q xnu
+          git -C xnu remote add origin https://github.com/apple-oss-distributions/xnu.git
+          git -C xnu fetch -q --depth 1 origin "$XNU_SHA"
+          git -C xnu checkout -q --detach FETCH_HEAD
+
+          git init -q pixelios-kernel
+          git -C pixelios-kernel remote add origin https://github.com/PixOS-Project/pixelios-kernel.git
+          git -C pixelios-kernel fetch -q --depth 1 origin "$PIXOS_SHA"
+          git -C pixelios-kernel checkout -q --detach FETCH_HEAD
+
+          mkdir -p report
+          {
+            echo "XNU revision: $(git -C xnu rev-parse HEAD)"
+            echo "PixOS revision: $(git -C pixelios-kernel rev-parse HEAD)"
+            echo "Workflow revision: $GITHUB_SHA"
+          } | tee report/source-revisions.txt
+
+      - name: Check 8796 patch applicability and 12377 boot ABI
+        shell: bash
+        run: |
+          set -uo pipefail
+          python3 - <<'PY'
+          import pathlib, re, subprocess
+
+          root = pathlib.Path.cwd()
+          xnu = root / "xnu"
+          pixos = root / "pixelios-kernel"
+          report = root / "report/stage3-bluejay-port-audit.md"
+          patches = [
+              "0004-sweet-machine-config.patch",
+              "0006-sweet-master-config-open-source-asm-pmap.patch",
+              "0016-sweet-device-tree-platform-expert.patch",
+              "0017-sweet-device-tree-virtual-timer-irq.patch",
+              "0018-sweet-boot-cpu-driver.patch",
+          ]
+
+          lines = [
+              "# Stage 3 bluejay port audit",
+              "",
+              "This is a source compatibility report. It does not build or certify a Pixel 6a kernel.",
+              "",
+              "## Existing PixOS patch applicability against XNU 12377",
+              "",
+              "| Patch | Result | First diagnostic |",
+              "|---|---|---|",
+          ]
+          for name in patches:
+              path = pixos / "xnu/patches" / name
+              proc = subprocess.run(
+                  ["git", "-C", str(xnu), "apply", "--check", str(path)],
+                  text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+              )
+              first = (proc.stdout.strip().splitlines() or ["clean"])[0].replace("|", "\\|")
+              result = "applies" if proc.returncode == 0 else "needs manual rebase"
+              lines.append(f"| `{name}` | {result} | `{first}` |")
+
+          header = (xnu / "pexpert/pexpert/arm64/boot.h").read_text()
+          boot_line = re.search(r"#define\s+BOOT_LINE_LENGTH\s+(\d+)", header)
+          if not boot_line:
+              raise SystemExit("Could not read BOOT_LINE_LENGTH from pinned XNU")
+          lines += [
+              "",
+              "## XNU 12377 boot ABI facts",
+              "",
+              f"- `BOOT_LINE_LENGTH`: {boot_line.group(1)} bytes.",
+              "- `boot_args` declarations: `pexpert/pexpert/arm64/boot.h`.",
+              "- The current PixOS loader mirrors 608 command-line bytes and asserts a 736-byte structure; it must be ported before a 12377 payload can be built.",
+              "",
+              "## Required next work",
+              "",
+              "1. Rebase machine configuration, early entry, platform expert, GICv3/timer and CPU startup onto XNU 12377.",
+              "2. Update the shim and payload generator to the pinned 12377 `boot_args` ABI and validate the generated ADT and memory ranges.",
+              "3. Add a reviewed `BLUEJAY` machine profile and a build script; only then add a kernel-build job that uploads `mach.development.bluejay` and symbols.",
+              "",
+              "The B2L `mach.development.b2l` binary is not a bluejay substitute.",
+          ]
+          report.write_text("\n".join(lines) + "\n")
+          print(report.read_text())
+          PY
+
+      - name: Upload Stage 3 audit
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: stage3-bluejay-port-audit
+          path: report/
+          retention-days: 14
