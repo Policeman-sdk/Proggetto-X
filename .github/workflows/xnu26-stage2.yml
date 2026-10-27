@@ -1,0 +1,132 @@
+# Stage 2 - build the iOS 26 (xnu-12377) kernel in CI, console-only (no IPSW data).
+# Put this file in your PUBLIC repo as .github/workflows/xnu26-stage2.yml.
+#
+# UNTESTED DRAFT. What stage 1 proved (real log): Xcode 26.5 + iphoneos SDK 26.5 exist on
+# macos-26, KDK 25F71 downloads and installs, xnu-12377.121.6 checks out, and all 59 B2L
+# patches apply cleanly. Stage 1 stopped in prepare-xnu.sh because its last step builds a
+# signed arm64e bootstrap and reads Apple's launchd cache out of an IPSW-derived image
+# (out/ipsw/ios26-userdata.hfs.img). We replace that step with a 1-byte stub (the B2L repo's
+# own tests use the same stub), so nothing from an IPSW ever enters this public CI.
+#
+# What this stage tries:
+#   A. darwin-xnu-build (blacktop) already has a macOS 26.5 recipe with the same KDK
+#      (25F71) and Darwin 25.5.0: use it ONLY to build the dependency root
+#      (dtrace/ctf tools, AvailabilityVersions, xnu/libsystem headers, libplatform, libfirehose).
+#   B. Rebuild libfirehose_kernel for iphoneos arm64 (B2L needs that, dxb builds arm64e/x86_64).
+#   C. Run B2L's own build-kernel.sh (TARGET DEVELOPMENT ARM64 B2L) against that root.
+# Success here only proves the toolchain; bluejay (Pixel 6a) support comes in stage 3.
+
+name: xnu26-stage2
+
+on:
+  workflow_dispatch:
+
+env:
+  KDK_TAG: "25F71"
+  KDKROOT: /Library/Developer/KDKs/KDK_26.5_25F71.kdk
+  DXB_SHA: 663906528d1cd5ea8fde7de6f16de73db9511549      # blacktop/darwin-xnu-build, has 26.5
+  B2L_REPO: https://github.com/orhunnx/beyond2lte-ios
+  B2L_SHA: 9c6bae4dab4345ff537b1fc2c9de90ae01362c4b       # the revision stage 1 used
+
+jobs:
+  build:
+    runs-on: macos-26
+    timeout-minutes: 180
+    steps:
+      - name: Xcode 26.5, tools
+        run: |
+          sudo xcode-select -s /Applications/Xcode_26.5.app
+          xcodebuild -version
+          echo "DEVELOPER_DIR=/Applications/Xcode_26.5.app/Contents/Developer" >> "$GITHUB_ENV"
+          brew install jq gum bash cmake ninja
+          # dxb only checks that `xcodes` exists; Xcode is preinstalled
+          printf '#!/bin/sh\nexit 0\n' | sudo tee /usr/local/bin/xcodes >/dev/null
+          sudo chmod +x /usr/local/bin/xcodes
+
+      - name: Install KDK 26.5 (25F71) from the Dortania mirror
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p kdk && gh release download "$KDK_TAG" -R dortania/KdkSupportPkg -D kdk -p '*.dmg'
+          hdiutil attach kdk/*.dmg -nobrowse -mountpoint /tmp/kdkmnt
+          sudo installer -pkg /tmp/kdkmnt/KernelDebugKit.pkg -target /
+          hdiutil detach /tmp/kdkmnt || true
+          ls "$KDKROOT" "$KDKROOT/System/Library"
+          # B2L wants Kernel.framework private headers under KDKROOT; report what is there
+          ls "$KDKROOT/System/Library/Frameworks/Kernel.framework/Versions/A/PrivateHeaders" | head -20 || true
+
+      - name: Fetch darwin-xnu-build and B2L
+        run: |
+          git init -q dxb && git -C dxb fetch -q --depth 1 https://github.com/blacktop/darwin-xnu-build "$DXB_SHA"
+          git -C dxb checkout -q FETCH_HEAD
+          git init -q b2l && git -C b2l fetch -q --depth 1 "$B2L_REPO" "$B2L_SHA"
+          git -C b2l checkout -q FETCH_HEAD
+
+      - name: A. Build the dependency root with dxb (stop before dxb's own kernel build)
+        working-directory: dxb
+        env:
+          MACOS_VERSION: "26.5"
+          KERNEL_CONFIG: DEVELOPMENT
+          ARCH_CONFIG: ARM64
+          MACHINE_CONFIG: VMAPPLE
+        run: |
+          python3 - <<'EOF'
+          import pathlib
+          p = pathlib.Path('build.sh'); s = p.read_text()
+          needle = '    if [ "$BUILDLIB" -ne "0" ]; then\n        build_xnu_library'
+          assert needle in s, 'dxb main() changed; adjust the stop point'
+          p.write_text(s.replace(needle, '    echo "DEPS READY"; exit 0\n' + needle, 1))
+          EOF
+          bash build.sh
+          ls -la fakeroot/usr/local/lib/kernel fakeroot/usr/local/libexec || true
+
+      - name: B. Rebuild libfirehose_kernel for iphoneos arm64
+        run: |
+          set -x
+          DEPS="$PWD/dxb/fakeroot"
+          cd dxb/libdispatch
+          xcodebuild install -project libdispatch.xcodeproj -target libfirehose_kernel \
+            -configuration Release -sdk iphoneos -arch arm64 \
+            OBJROOT="$PWD/../build/fh-ios.obj" SYMROOT="$PWD/../build/fh-ios.sym" DSTROOT="$DEPS" \
+            CODE_SIGNING_ALLOWED=NO \
+            OTHER_CFLAGS='$(inherited) -mcpu=generic -march=armv8-a+crypto' \
+            HEADER_SEARCH_PATHS="$DEPS/usr/local/include/kernel $DEPS/System/Library/Frameworks/Kernel.framework/PrivateHeaders $DEPS/System/Library/Frameworks/Kernel.framework/Headers $PWD $DEPS/usr/local/include/os $DEPS/usr/local/include/firehose $KDKROOT/System/Library/Frameworks/Kernel.framework/Versions/A/PrivateHeaders"
+          cp "$DEPS/usr/local/lib/kernel/liblibfirehose_kernel.a" "$DEPS/usr/local/lib/kernel/libfirehose_kernel.a"
+          lipo -info "$DEPS/usr/local/lib/kernel/libfirehose_kernel.a"
+
+      - name: C1. Prepare pinned XNU for B2L (userspace payload = STUB, no IPSW data)
+        run: |
+          bash b2l/scripts/fetch-xnu.sh "$PWD/xnu-b2l"
+          # same as prepare-xnu.sh minus the step that needs the IPSW-derived image
+          sed '/build-userspace-bootstrap.py/d' b2l/scripts/prepare-xnu.sh > b2l/scripts/prepare-xnu-stub.sh
+          bash b2l/scripts/prepare-xnu-stub.sh "$PWD/xnu-b2l"
+          cat > xnu-b2l/bsd/kern/b2l_userspace_payload.h <<'EOF'
+          /* STUB payload for console-only boot. Contains no Apple data. */
+          static const unsigned char b2l_apps_executable[1] = {0};
+          static const unsigned char b2l_apps_job[1] = {0};
+          static const unsigned char b2l_apps_launch_cache[1] = {0};
+          EOF
+
+      - name: C2. Build the B2L kernel
+        env:
+          XNU_PATH: ${{ github.workspace }}/xnu-b2l
+          BUILD_DIR: ${{ github.workspace }}/out/xnu
+          B2L_DEPSROOT: ${{ github.workspace }}/dxb/fakeroot
+          BUILD_JOBS: "4"
+        run: |
+          bash b2l/scripts/build-kernel.sh CWARNFLAGS=-w CXXWARNFLAGS=-w 2>&1 | tee build.log | tail -400
+
+      - name: Collect
+        if: always()
+        run: |
+          mkdir -p collect
+          cp build.log collect/ 2>/dev/null || true
+          find out -name 'kernel*' -maxdepth 6 -type f -not -name '*.dSYM' 2>/dev/null | head -20 | while read f; do cp "$f" collect/; done
+          ls -la collect
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: stage2-kernel-and-log
+          path: collect
+          retention-days: 7
