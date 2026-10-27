@@ -62,6 +62,13 @@ jobs:
           git init -q b2l && git -C b2l fetch -q --depth 1 "$B2L_REPO" "$B2L_SHA"
           git -C b2l checkout -q FETCH_HEAD
 
+      - name: Cache dxb tree (dependency root)
+        id: dxbcache
+        uses: actions/cache@v4
+        with:
+          path: dxb
+          key: dxb-${{ env.DXB_SHA }}-kdk25F71-v1
+
       - name: A. Build the dependency root with dxb (stop before dxb's own kernel build)
         working-directory: dxb
         env:
@@ -74,8 +81,9 @@ jobs:
           import pathlib
           p = pathlib.Path('build.sh'); s = p.read_text()
           needle = '    if [ "$BUILDLIB" -ne "0" ]; then\n        build_xnu_library'
-          assert needle in s, 'dxb main() changed; adjust the stop point'
-          p.write_text(s.replace(needle, '    echo "DEPS READY"; exit 0\n' + needle, 1))
+          if 'DEPS READY' not in s:
+              assert needle in s, 'dxb main() changed; adjust the stop point'
+              p.write_text(s.replace(needle, '    echo "DEPS READY"; exit 0\n' + needle, 1))
           EOF
           bash build.sh
           ls -la fakeroot/usr/local/lib/kernel fakeroot/usr/local/libexec || true
@@ -84,13 +92,20 @@ jobs:
         run: |
           set -x
           DEPS="$PWD/dxb/fakeroot"
+          IOS_SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
+          MAC_SDK="$(xcrun --sdk macosx --show-sdk-path)"
+          # libfirehose_kernel compiles with -nostdinc, so TargetConditionals.h must come from a
+          # Kernel.framework/Headers dir (that is where the macOS build found it). Show where it lives.
+          find "$IOS_SDK" "$MAC_SDK" "$KDKROOT" "$DEPS" -name TargetConditionals.h 2>/dev/null | head -20
+          ls -d "$IOS_SDK/System/Library/Frameworks/Kernel.framework/Headers" 2>&1 || true
+          ls -d "$MAC_SDK/System/Library/Frameworks/Kernel.framework/Headers" 2>&1 || true
           cd dxb/libdispatch
           xcodebuild install -project libdispatch.xcodeproj -target libfirehose_kernel \
             -configuration Release -sdk iphoneos -arch arm64 \
             OBJROOT="$PWD/../build/fh-ios.obj" SYMROOT="$PWD/../build/fh-ios.sym" DSTROOT="$DEPS" \
             CODE_SIGNING_ALLOWED=NO \
             OTHER_CFLAGS='$(inherited) -mcpu=generic -march=armv8-a+crypto' \
-            HEADER_SEARCH_PATHS="$DEPS/usr/local/include/kernel $DEPS/System/Library/Frameworks/Kernel.framework/PrivateHeaders $DEPS/System/Library/Frameworks/Kernel.framework/Headers $PWD $DEPS/usr/local/include/os $DEPS/usr/local/include/firehose $KDKROOT/System/Library/Frameworks/Kernel.framework/Versions/A/PrivateHeaders"
+            HEADER_SEARCH_PATHS="$DEPS/usr/local/include/kernel $DEPS/System/Library/Frameworks/Kernel.framework/PrivateHeaders $DEPS/System/Library/Frameworks/Kernel.framework/Headers $PWD $DEPS/usr/local/include/os $DEPS/usr/local/include/firehose $KDKROOT/System/Library/Frameworks/Kernel.framework/Versions/A/PrivateHeaders $KDKROOT/System/Library/Frameworks/Kernel.framework/Versions/A/Headers $IOS_SDK/System/Library/Frameworks/Kernel.framework/Headers $MAC_SDK/System/Library/Frameworks/Kernel.framework/Headers"
           cp "$DEPS/usr/local/lib/kernel/liblibfirehose_kernel.a" "$DEPS/usr/local/lib/kernel/libfirehose_kernel.a"
           lipo -info "$DEPS/usr/local/lib/kernel/libfirehose_kernel.a"
 
