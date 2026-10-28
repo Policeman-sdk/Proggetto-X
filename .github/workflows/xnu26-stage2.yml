@@ -13,20 +13,34 @@
 #      (25F71) and Darwin 25.5.0: use it ONLY to build the dependency root
 #      (dtrace/ctf tools, AvailabilityVersions, xnu/libsystem headers, libplatform, libfirehose).
 #   B. Rebuild libfirehose_kernel for iphoneos arm64 (B2L needs that, dxb builds arm64e/x86_64).
-#   C. Run B2L's own build-kernel.sh (TARGET DEVELOPMENT ARM64 B2L) against that root.
-# Success here only proves the toolchain; bluejay (Pixel 6a) support comes in stage 3.
+#   C. Run B2L's own build-kernel.sh against that root. Select B2L for the known baseline,
+#      or B2L_GS101 with a B2L ref containing patches 0060-0062 for the bluejay profile.
+# A successful compile does not prove device boot; that still requires a controlled device run.
 
 name: xnu26-stage2
 
 on:
   workflow_dispatch:
+    inputs:
+      b2l_ref:
+        description: beyond2lte-ios ref containing the requested patch series
+        required: true
+        default: 9c6bae4dab4345ff537b1fc2c9de90ae01362c4b
+        type: string
+      machine_config:
+        description: kernel machine profile
+        required: true
+        default: B2L
+        type: choice
+        options:
+          - B2L
+          - B2L_GS101
 
 env:
   KDK_TAG: "25F71"
   KDKROOT: /Library/Developer/KDKs/KDK_26.5_25F71.kdk
   DXB_SHA: 663906528d1cd5ea8fde7de6f16de73db9511549      # blacktop/darwin-xnu-build, has 26.5
   B2L_REPO: https://github.com/orhunnx/beyond2lte-ios
-  B2L_SHA: 9c6bae4dab4345ff537b1fc2c9de90ae01362c4b       # the revision stage 1 used
 
 jobs:
   build:
@@ -56,11 +70,15 @@ jobs:
           ls "$KDKROOT/System/Library/Frameworks/Kernel.framework/Versions/A/PrivateHeaders" | head -20 || true
 
       - name: Fetch darwin-xnu-build and B2L
+        env:
+          B2L_REF: ${{ inputs.b2l_ref }}
         run: |
           git init -q dxb && git -C dxb fetch -q --depth 1 https://github.com/blacktop/darwin-xnu-build "$DXB_SHA"
           git -C dxb checkout -q FETCH_HEAD
-          git init -q b2l && git -C b2l fetch -q --depth 1 "$B2L_REPO" "$B2L_SHA"
+          git init -q b2l && git -C b2l fetch -q --depth 1 "$B2L_REPO" "$B2L_REF"
           git -C b2l checkout -q FETCH_HEAD
+          git -C b2l rev-parse HEAD | tee b2l.sha
+          echo "Building $B2L_REF / ${{ inputs.machine_config }}"
 
       - name: Cache dxb tree (dependency root)
         id: dxbcache
@@ -128,6 +146,7 @@ jobs:
           BUILD_DIR: ${{ github.workspace }}/out/xnu
           B2L_DEPSROOT: ${{ github.workspace }}/dxb/fakeroot
           BUILD_JOBS: "4"
+          MACHINE_CONFIG: ${{ inputs.machine_config }}
         run: |
           bash b2l/scripts/build-kernel.sh CWARNFLAGS=-w CXXWARNFLAGS=-w 2>&1 | tee build.log | tail -400
 
@@ -136,13 +155,14 @@ jobs:
         run: |
           mkdir -p collect
           cp build.log collect/ 2>/dev/null || true
-          # build-kernel.sh emits mach.development.b2l (not a file named kernel*).
-          find out -type f -name 'mach.development.b2l' -print -quit 2>/dev/null | while read f; do cp "$f" collect/; done
+          cp b2l.sha collect/ 2>/dev/null || true
+          # Kernel filenames include the lowercased machine config.
+          find out -type f -name 'mach.development*' -print 2>/dev/null | while read f; do cp "$f" collect/; done
           ls -la collect
 
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: stage2-kernel-and-log
+          name: stage2-${{ inputs.machine_config }}-kernel-and-log
           path: collect
           retention-days: 7
